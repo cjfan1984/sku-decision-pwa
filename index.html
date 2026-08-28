@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#172033">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <title>SKU决策PWA</title>
+  <style>
+    :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172033;background:#f4f6f8}
+    body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;box-sizing:border-box}
+    main{width:min(420px,100%);background:#fff;border:1px solid #e8ebf0;border-radius:22px;padding:28px;box-shadow:0 16px 48px rgba(23,32,51,.1);box-sizing:border-box}
+    h1{font-size:22px;margin:0 0 10px}p{font-size:15px;line-height:1.6;margin:8px 0;color:#5b6475}
+    .spinner{width:30px;height:30px;border:3px solid #dfe4ec;border-top-color:#2266dd;border-radius:50%;animation:spin .8s linear infinite;margin-bottom:20px}
+    .error{color:#a32828}.hint{font-size:13px;color:#7a8495}@keyframes spin{to{transform:rotate(360deg)}}
+  </style>
+</head>
+<body>
+  <main id="status"><div class="spinner"></div><h1>正在打开SKU决策台</h1><p>正在读取并解密最新数据…</p></main>
+  <script>
+    (() => {
+      const keyName = 'sku_pwa_key_v1';
+      const status = document.getElementById('status');
+      const decode = value => {
+        const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+        const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4);
+        return Uint8Array.from(atob(padded), char => char.charCodeAt(0));
+      };
+      const fail = (title, detail) => {
+        status.innerHTML = `<h1 class="error">${title}</h1><p>${detail}</p><p class="hint">如果你更换了手机或清除了Safari数据，请重新打开首次授权链接。</p>`;
+      };
+      const open = async () => {
+        try {
+          const fragment = new URLSearchParams(location.hash.slice(1));
+          const incoming = fragment.get('k');
+          if (incoming) {
+            if (decode(incoming).length !== 32) throw new Error('invalid-key');
+            localStorage.setItem(keyName, incoming);
+            history.replaceState(null, '', location.pathname + location.search);
+          }
+          const stored = localStorage.getItem(keyName);
+          if (!stored) {
+            fail('需要首次授权链接', '这个公开地址不包含业务数据。请使用收到的完整授权链接打开一次，无需输入密码。');
+            return;
+          }
+          const response = await fetch('./app.enc.json', { cache: 'no-store' });
+          if (!response.ok) throw new Error('payload');
+          const payload = await response.json();
+          const encrypted = decode(payload.ciphertext);
+          const key = await crypto.subtle.importKey('raw', decode(stored), 'AES-GCM', false, ['decrypt']);
+          const compressed = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: decode(payload.iv) }, key, encrypted);
+          const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
+          const html = await new Response(stream).arrayBuffer();
+          document.open();
+          document.write(new TextDecoder().decode(html));
+          document.close();
+        } catch (error) {
+          fail('无法解密数据', '授权链接可能不完整，或本机保存的授权信息已经失效。');
+        }
+      };
+      if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+      open();
+    })();
+  </script>
+</body>
+</html>
