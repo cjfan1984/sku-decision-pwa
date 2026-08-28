@@ -1,4 +1,4 @@
-const CACHE = 'sku-decision-pwa-encrypted-v1';
+const CACHE = 'sku-decision-pwa-encrypted-v2';
 const SHELL = ['./', './index.html', './app.enc.json', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', event => {

@@ -1,0 +1,108 @@
+name: Zero-GPT SKU Data Sync
+
+on:
+  schedule:
+    # 23:45 Asia/Shanghai. GitHub cron is UTC.
+    - cron: "45 15 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/**"
+      - "tests/**"
+      - "requirements.txt"
+      - ".github/workflows/sync-zero-gpt.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sku-production-zero-gpt
+  cancel-in-progress: true
+
+env:
+  SKU_SHEET_ID: 108o5gtxkUsWEZI8xfZFE89Kq83IfStQGNm6dvjIlAkk
+  GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+  PWA_APP_KEY: ${{ secrets.PWA_APP_KEY }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Enforce credential-only operation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$GOOGLE_SERVICE_ACCOUNT_JSON" ] || [ -z "$PWA_APP_KEY" ]; then
+            echo "ZERO_GPT_READY=false" >> "$GITHUB_ENV"
+            echo "NEEDS_CREDENTIALS: add GOOGLE_SERVICE_ACCOUNT_JSON and PWA_APP_KEY; no GPT/browser fallback will run."
+          else
+            echo "ZERO_GPT_READY=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install and test deterministic builder
+        if: env.ZERO_GPT_READY == 'true'
+        run: |
+          pip install -r requirements.txt pytest
+          python -m py_compile tools/build_encrypted_app.py tools/sync_google.py
+          pytest -q
+
+      - name: Sync authoritative snapshot
+        if: env.ZERO_GPT_READY == 'true'
+        run: |
+          python tools/sync_google.py \
+            --spreadsheet-id "$SKU_SHEET_ID" \
+            --status sync-status.json
+
+      - name: Verify encrypted output and stable manifest
+        if: env.ZERO_GPT_READY == 'true'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+
+          envelope = json.loads(Path('app.enc.json').read_text())
+          manifest = json.loads(Path('pwa-data-version.json').read_text())
+          assert envelope['v'] == 1
+          assert envelope['alg'] == 'AES-256-GCM'
+          assert envelope['compression'] == 'gzip'
+          assert len(manifest['datasetSha256']) == 64
+          assert manifest['records'] > 0
+          assert hashlib.sha256(Path('app.enc.json').read_bytes()).hexdigest() == manifest['envelopeSha256']
+          print('PRODUCTION_ENCRYPTED_CONTRACT=PASS', manifest['records'], manifest['version'])
+          PY
+
+      - name: Commit only a real source-data change
+        if: env.ZERO_GPT_READY == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.enc.json pwa-data-version.json
+          if git diff --cached --quiet; then
+            echo "PRODUCTION_DATA_CHANGED=false"
+            exit 0
+          fi
+          git commit -m "Sync encrypted SKU dashboard data"
+          git push origin HEAD:main
+          echo "PRODUCTION_DATA_CHANGED=true"
+
+      - name: Upload non-sensitive status
+        if: always() && env.ZERO_GPT_READY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sku-production-zero-gpt-status
+          path: sync-status.json
+          if-no-files-found: ignore
+          retention-days: 7
