@@ -3,7 +3,7 @@
   "short_name": "SKU决策",
   "description": "WB/Ozon选品、利润、补数与止损决策工作台",
   "lang": "zh-CN",
-  "start_url": "./",
+  "id": "./",
   "scope": "./",
   "display": "standalone",
   "background_color": "#f4f6f8",
