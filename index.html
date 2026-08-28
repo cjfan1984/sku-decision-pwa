@@ -39,7 +39,6 @@
           if (incoming) {
             if (decode(incoming).length !== 32) throw new Error('invalid-key');
             localStorage.setItem(keyName, incoming);
-            history.replaceState(null, '', location.pathname + location.search);
           }
           const stored = localStorage.getItem(keyName);
           if (!stored) {
