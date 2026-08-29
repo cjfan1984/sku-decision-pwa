@@ -30,15 +30,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
       - name: Enforce credential-only operation
         shell: bash
         run: |
@@ -49,6 +40,19 @@ jobs:
           else
             echo "ZERO_GPT_READY=true" >> "$GITHUB_ENV"
           fi
+
+      - name: Checkout
+        if: env.ZERO_GPT_READY == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        if: env.ZERO_GPT_READY == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
 
       - name: Install and test deterministic builder
         if: env.ZERO_GPT_READY == 'true'
