@@ -58,10 +58,10 @@ jobs:
         if: env.ZERO_GPT_READY == 'true'
         run: |
           pip install -r requirements.txt pytest
-          python -m py_compile tools/build_encrypted_app.py tools/sync_google.py
+          python -m py_compile tools/build_encrypted_app.py tools/physical_sku.py tools/sync_google.py
           pytest -q
 
-      - name: Sync authoritative snapshot
+      - name: Sync authoritative snapshot through physical-SKU gate
         if: env.ZERO_GPT_READY == 'true'
         run: |
           python tools/sync_google.py \
@@ -77,13 +77,16 @@ jobs:
 
           envelope = json.loads(Path('app.enc.json').read_text())
           manifest = json.loads(Path('pwa-data-version.json').read_text())
+          status = json.loads(Path('sync-status.json').read_text())
           assert envelope['v'] == 1
           assert envelope['alg'] == 'AES-256-GCM'
           assert envelope['compression'] == 'gzip'
           assert len(manifest['datasetSha256']) == 64
           assert manifest['records'] > 0
           assert hashlib.sha256(Path('app.enc.json').read_bytes()).hexdigest() == manifest['envelopeSha256']
-          print('PRODUCTION_ENCRYPTED_CONTRACT=PASS', manifest['records'], manifest['version'])
+          assert status['physicalSkuAudit']['physicalSkuGate'] == 'PASS'
+          assert status['physicalSkuAudit']['records'] == manifest['records']
+          print('PRODUCTION_PHYSICAL_SKU_GATE=PASS', manifest['records'], manifest['version'])
           PY
 
       - name: Commit only a real source-data change
