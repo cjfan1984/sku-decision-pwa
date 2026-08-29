@@ -8,6 +8,10 @@ from typing import Iterable
 
 PLACEHOLDER_TOKENS = ("待补", "未闭环", "待核", "待研究", "待锁", "待确认", "缺")
 EXACT_EVIDENCE_TOKENS = ("精确规格", "精确sku", "精确 sku", "商品卡", "exact")
+NEGATIVE_EVIDENCE_TOKENS = (
+    "禁止", "不能", "不可", "不继承", "不得继承", "禁止继承", "不得用于",
+    "错类", "撤销", "不是", "误配", "误判", "不作为", "仅用于排除", "仅排除",
+)
 
 BLIND_RIVET_TOKENS = ("抽芯铆钉", "抽芯铆", "blind rivet", "вытяжн")
 RIVET_NUT_TOKENS = ("拉铆螺母", "铆螺母", "rivet nut", "резьбов")
@@ -19,21 +23,10 @@ DRILL_TOKENS = ("钻头", "drill bit", "сверл")
 THREAD_RE = re.compile(r"(?<![a-z0-9])m\s*(3|4|5|6|8|10|12)(?!\d)", re.I)
 DIM_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*[x×*]\s*(\d+(?:\.\d+)?)(?:\s*(?:mm|毫米))?", re.I)
 PCS_RE = re.compile(r"(?<!\d)(\d{1,5})\s*(?:pcs?|pieces?|件|枚|颗|条|支|只|片|卷)(?!\w)", re.I)
-KG_PACK_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*kg\s*(?:装|pack|package)?", re.I)
+# Only explicit kg-pack wording is a package identity. Do not treat product weight,
+# tensile rating or shipping weight such as 0.15kg / 18kg as a kg package.
+KG_PACK_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*kg\s*(?:装|pack|package)\b", re.I)
 POWER_RE = re.compile(r"(?<!\d)(\d{2,5})\s*w(?!\w)", re.I)
-
-
-def _text(row: dict) -> str:
-    fields = (
-        "产品族",
-        "产品名称/SKU",
-        "完整目标产品规格",
-        "实际首选货源规格",
-        "规格差异",
-        "证据匹配层级",
-        "当前动作",
-    )
-    return " | ".join(str(row.get(field) or "") for field in fields).lower()
 
 
 def _clean(value: object) -> str:
@@ -44,8 +37,37 @@ def _has_any(text: str, tokens: Iterable[str]) -> bool:
     return any(token.lower() in text for token in tokens)
 
 
+def _identity_text(row: dict) -> str:
+    fields = ("产品族", "产品名称/SKU", "完整目标产品规格")
+    return " | ".join(str(row.get(field) or "") for field in fields).lower()
+
+
+def _evidence_text(row: dict) -> str:
+    # These fields can carry source/spec notes. Current action is intentionally
+    # excluded so a sentence such as "禁止继承拉铆螺母枪证据" is not itself evidence.
+    fields = ("实际首选货源规格", "规格差异", "证据匹配层级")
+    return " | ".join(str(row.get(field) or "") for field in fields).lower()
+
+
+def _affirmative_token(text: str, tokens: Iterable[str]) -> bool:
+    """True only when a token is not locally negated/rejected."""
+    lowered = text.lower()
+    for token in tokens:
+        needle = token.lower()
+        start = 0
+        while True:
+            pos = lowered.find(needle, start)
+            if pos < 0:
+                break
+            window = lowered[max(0, pos - 28): pos + len(needle) + 36]
+            if not any(neg.lower() in window for neg in NEGATIVE_EVIDENCE_TOKENS):
+                return True
+            start = pos + len(needle)
+    return False
+
+
 def classify_family(row: dict) -> str:
-    text = _text(row)
+    text = _identity_text(row)
     if _has_any(text, BLIND_RIVET_TOKENS):
         return "blind_rivet"
     if _has_any(text, RIVET_NUT_TOKENS):
@@ -63,7 +85,7 @@ def classify_family(row: dict) -> str:
 
 
 def identity_tokens(row: dict) -> dict:
-    text = _text(row)
+    text = _identity_text(row)
     dims = sorted({"×".join(m) for m in DIM_RE.findall(text)})
     pieces = sorted({int(v) for v in PCS_RE.findall(text)})
     kg_packs = sorted({float(v) for v in KG_PACK_RE.findall(text)})
@@ -125,33 +147,33 @@ def _exact_claim(row: dict) -> bool:
 
 
 def validate_row(row: dict) -> list[str]:
-    text = _text(row)
+    identity_text = _identity_text(row)
+    evidence_text = _evidence_text(row)
     family = classify_family(row)
     identity = identity_tokens(row)
     problems: list[str] = []
 
-    # Mutually exclusive product systems: never share sales/price evidence.
-    blind = _has_any(text, BLIND_RIVET_TOKENS)
-    nut = _has_any(text, RIVET_NUT_TOKENS)
-    if blind and nut:
-        problems.append("blind-rivet/rivet-nut evidence mixed")
+    # Target identity itself must not mix mutually exclusive systems.
+    if _has_any(identity_text, BLIND_RIVET_TOKENS) and _has_any(identity_text, RIVET_NUT_TOKENS):
+        problems.append("target identity mixes blind rivet and rivet nut")
     if family == "blind_rivet" and identity["threads"]:
-        problems.append("M-thread evidence attached to blind riveter")
+        problems.append("M-thread in blind-riveter target identity")
 
-    roll = _has_any(text, VACUUM_ROLL_TOKENS)
-    bag = _has_any(text, VACUUM_BAG_TOKENS)
-    if roll and bag:
-        problems.append("vacuum-roll/pre-cut-bag evidence mixed")
+    # Evidence notes may mention rejected alternatives. Only affirmative source
+    # evidence from another physical system is treated as contamination.
+    if family == "blind_rivet" and _affirmative_token(evidence_text, RIVET_NUT_TOKENS):
+        problems.append("rivet-nut evidence attached to blind-riveter target")
+    if family == "rivet_nut" and _affirmative_token(evidence_text, BLIND_RIVET_TOKENS):
+        problems.append("blind-rivet evidence attached to rivet-nut target")
+    if family == "vacuum_roll" and _affirmative_token(evidence_text, VACUUM_BAG_TOKENS):
+        problems.append("pre-cut-bag evidence attached to vacuum-roll target")
+    if family == "vacuum_bag" and _affirmative_token(evidence_text, VACUUM_ROLL_TOKENS):
+        problems.append("vacuum-roll evidence attached to pre-cut-bag target")
 
-    adapter = _has_any(text, ADAPTER_TOKENS)
-    drill = _has_any(text, DRILL_TOKENS)
-    if adapter and drill and family != "tool_adapter":
-        problems.append("tool-adapter/drill-bit evidence mixed")
-
-    # Packaging is part of SKU identity. A row must not claim two incompatible
-    # package bases such as 1 kg and 100 pcs when it has SKU-level market data.
+    # Packaging is part of SKU identity. Only explicit kg-pack wording counts;
+    # product/net/gross weight does not.
     if identity["kg_packs"] and identity["pieces"] and _has_market_signal(row):
-        problems.append("kg-pack and piece-pack evidence mixed")
+        problems.append("target identity mixes kg-pack and piece-pack")
 
     # Exact-SKU market evidence must contain a usable target identity.
     target_spec = _clean(row.get("完整目标产品规格"))
@@ -185,8 +207,6 @@ def validate_and_enrich_snapshot(rows: list[dict]) -> tuple[list[dict], dict]:
         if problems:
             blocked.append({"SKU_KEY": item.get("SKU_KEY"), "problems": problems})
 
-    # Production PWA is fail-closed: a detected cross-system contamination is
-    # safer to stop than to publish a plausible but false explosive-product card.
     if blocked:
         sample = "; ".join(f"{x['SKU_KEY']}: {','.join(x['problems'])}" for x in blocked[:8])
         raise SystemExit(f"physical SKU evidence gate blocked {len(blocked)} rows: {sample}")
@@ -196,6 +216,6 @@ def validate_and_enrich_snapshot(rows: list[dict]) -> tuple[list[dict], dict]:
         "records": len(enriched),
         "blocked": 0,
         "families": dict(families.most_common()),
-        "rulesVersion": "physical-sku-v2-2026-08-29",
+        "rulesVersion": "physical-sku-v2.1-2026-08-29",
     }
     return enriched, audit
