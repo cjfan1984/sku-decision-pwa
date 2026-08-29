@@ -9,6 +9,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from build_encrypted_app import load_key, sync
+from physical_sku import validate_and_enrich_snapshot
 
 
 def credentials():
@@ -35,7 +36,7 @@ def snapshot_rows(spreadsheet_id: str) -> list[dict]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Read the authoritative Google snapshot and update the encrypted PWA.")
+    parser = argparse.ArgumentParser(description="Read Google snapshot, enforce physical-SKU evidence gates, and update encrypted PWA.")
     parser.add_argument("--spreadsheet-id", required=True)
     parser.add_argument("--current-envelope", type=Path, default=Path("app.enc.json"))
     parser.add_argument("--output", type=Path, default=Path("app.enc.json"))
@@ -45,7 +46,10 @@ def main() -> None:
     key_value = os.getenv("PWA_APP_KEY")
     if not key_value:
         raise SystemExit("missing PWA_APP_KEY; refusing unencrypted output")
+
     rows = snapshot_rows(args.spreadsheet_id)
+    rows, gate_audit = validate_and_enrich_snapshot(rows)
+
     temp = Path("/tmp/sku-snapshot.private.json")
     temp.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
     result = sync(
@@ -57,6 +61,7 @@ def main() -> None:
         partial=False,
         expected_records=len(rows),
     )
+    result["physicalSkuAudit"] = gate_audit
     args.status.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 
