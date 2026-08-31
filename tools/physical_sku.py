@@ -146,6 +146,17 @@ def _exact_claim(row: dict) -> bool:
     return _has_any(evidence, EXACT_EVIDENCE_TOKENS)
 
 
+def _placeholder_only_spec(value: object) -> bool:
+    reduced = _clean(value)
+    if not reduced:
+        return True
+    for token in PLACEHOLDER_TOKENS:
+        reduced = reduced.replace(token, "")
+    reduced = re.sub(r"规格|参数|信息|属性|目标|产品|型号|待定|bom", "", reduced, flags=re.I)
+    reduced = re.sub(r"[\s|｜/、,，;；:：()（）\[\]【】_.+\-]+", "", reduced)
+    return not reduced
+
+
 def validate_row(row: dict) -> list[str]:
     identity_text = _identity_text(row)
     evidence_text = _evidence_text(row)
@@ -178,7 +189,10 @@ def validate_row(row: dict) -> list[str]:
     # Exact-SKU market evidence must contain a usable target identity.
     target_spec = _clean(row.get("完整目标产品规格"))
     if _exact_claim(row) and _has_market_signal(row):
-        if not target_spec or all(token in target_spec for token in ("待", "核")):
+        # A concrete identity can still have one unresolved attribute such as
+        # material or certification. Only an absent/placeholder-only identity
+        # is invalid; the old `待` + `核` substring rule rejected 27 real rows.
+        if _placeholder_only_spec(target_spec):
             problems.append("exact evidence missing target specification")
 
     return problems
@@ -188,7 +202,7 @@ def validate_and_enrich_snapshot(rows: list[dict]) -> tuple[list[dict], dict]:
     keys = [_clean(row.get("SKU_KEY")) for row in rows]
     duplicate_keys = sorted(key for key, count in Counter(keys).items() if key and count > 1)
     if duplicate_keys:
-        raise SystemExit(f"duplicate SKU_KEY in snapshot: {duplicate_keys[:5]}")
+        raise SystemExit(f"duplicate SKU_KEY values in snapshot: {len(duplicate_keys)}")
 
     enriched: list[dict] = []
     blocked: list[dict] = []
@@ -208,8 +222,9 @@ def validate_and_enrich_snapshot(rows: list[dict]) -> tuple[list[dict], dict]:
             blocked.append({"SKU_KEY": item.get("SKU_KEY"), "problems": problems})
 
     if blocked:
-        sample = "; ".join(f"{x['SKU_KEY']}: {','.join(x['problems'])}" for x in blocked[:8])
-        raise SystemExit(f"physical SKU evidence gate blocked {len(blocked)} rows: {sample}")
+        reason_counts = Counter(problem for item in blocked for problem in item["problems"])
+        summary = ", ".join(f"{reason}={count}" for reason, count in reason_counts.most_common())
+        raise SystemExit(f"physical SKU evidence gate blocked {len(blocked)} rows: {summary}")
 
     audit = {
         "physicalSkuGate": "PASS",

@@ -56,3 +56,51 @@ def test_sync_skips_second_random_encryption(tmp_path):
     second = app.sync(current, rows, current, manifest, key, partial=True, expected_records=2)
     assert second["state"] == "NO_CHANGE"
     assert current.read_text(encoding="utf-8") == first_ciphertext
+
+
+def test_sync_recovers_from_corrupt_current_envelope(tmp_path):
+    key = bytes(range(32))
+    payload = {"records": [snapshot()], "queues": {}, "stats": {"total": 1}, "generated_at": "old", "_python_v4": {}}
+    recovery = tmp_path / "recovery.enc.json"
+    recovery.write_text(json.dumps(app.encrypt_html(dashboard_html(payload), key)), encoding="utf-8")
+    current = tmp_path / "app.enc.json"
+    current.write_text("PLACEHOLDER", encoding="utf-8")
+    rows = tmp_path / "rows.json"
+    rows.write_text(json.dumps([snapshot()], ensure_ascii=False), encoding="utf-8")
+    manifest = tmp_path / "version.json"
+
+    result = app.sync(
+        current,
+        rows,
+        current,
+        manifest,
+        key,
+        expected_records=1,
+        recovery_envelope_path=recovery,
+    )
+
+    assert result["state"] == "RECOVERED"
+    assert len(app.extract_payload(app.decrypt_html(current, key))["records"]) == 1
+
+
+def test_sync_recovers_when_current_envelope_is_json_array(tmp_path):
+    key = bytes(range(32))
+    payload = {"records": [snapshot()], "queues": {}, "stats": {"total": 1}, "generated_at": "old", "_python_v4": {}}
+    recovery = tmp_path / "recovery.enc.json"
+    recovery.write_text(json.dumps(app.encrypt_html(dashboard_html(payload), key)), encoding="utf-8")
+    current = tmp_path / "app.enc.json"
+    current.write_text("[]", encoding="utf-8")
+    rows = tmp_path / "rows.json"
+    rows.write_text(json.dumps([snapshot()], ensure_ascii=False), encoding="utf-8")
+
+    result = app.sync(
+        current,
+        rows,
+        current,
+        tmp_path / "version.json",
+        key,
+        expected_records=1,
+        recovery_envelope_path=recovery,
+    )
+
+    assert result["state"] == "RECOVERED"

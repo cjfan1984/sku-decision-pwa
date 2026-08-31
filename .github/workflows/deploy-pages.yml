@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Zero-GPT SKU Data Sync"]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
@@ -16,16 +20,48 @@ concurrency:
 
 jobs:
   deploy:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Validate encrypted production structure
+        run: python tools/validate_deploy.py
+      - name: Detect keyed validation availability
+        id: keyed_validation
+        env:
+          PWA_APP_KEY: ${{ secrets.PWA_APP_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${PWA_APP_KEY:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install pinned decryption dependency
+        if: steps.keyed_validation.outputs.enabled == 'true'
+        run: pip install cryptography==45.0.6
+      - name: Verify production key and decrypted record count
+        if: steps.keyed_validation.outputs.enabled == 'true'
+        env:
+          PWA_APP_KEY: ${{ secrets.PWA_APP_KEY }}
+        run: python tools/validate_deploy.py --key-env PWA_APP_KEY
+      - name: Stage public runtime only
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp index.html sw.js manifest.webmanifest icon.svg icon-192.png icon-512.png app.enc.json pwa-data-version.json _site/
+          touch _site/.nojekyll
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: .
+          path: _site
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4

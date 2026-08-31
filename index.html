@@ -8,6 +8,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="./icon-192.png">
   <title>SKU决策PWA</title>
   <style>
     :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172033;background:#f4f6f8}
@@ -15,7 +16,10 @@
     main{width:min(420px,100%);background:#fff;border:1px solid #e8ebf0;border-radius:22px;padding:28px;box-shadow:0 16px 48px rgba(23,32,51,.1);box-sizing:border-box}
     h1{font-size:22px;margin:0 0 10px}p{font-size:15px;line-height:1.6;margin:8px 0;color:#5b6475}
     .spinner{width:30px;height:30px;border:3px solid #dfe4ec;border-top-color:#2266dd;border-radius:50%;animation:spin .8s linear infinite;margin-bottom:20px}
-    .error{color:#a32828}.hint{font-size:13px;color:#7a8495}@keyframes spin{to{transform:rotate(360deg)}}
+    .error{color:#a32828}.hint{font-size:13px;color:#7a8495}
+    form{display:grid;gap:10px;margin-top:18px}input,button{font:inherit;border-radius:12px;padding:12px 14px}
+    input{border:1px solid #cfd5df;min-width:0}button{border:0;background:#2266dd;color:#fff;font-weight:700}
+    @keyframes spin{to{transform:rotate(360deg)}}
   </style>
 </head>
 <body>
@@ -23,6 +27,7 @@
   <script>
     (() => {
       const keyName = 'sku_pwa_key_v1';
+      const dataCache = 'sku-decision-pwa-data-v1';
       const status = document.getElementById('status');
       const decode = value => {
         const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
@@ -30,35 +35,111 @@
         return Uint8Array.from(atob(padded), char => char.charCodeAt(0));
       };
       const fail = (title, detail) => {
-        status.innerHTML = `<h1 class="error">${title}</h1><p>${detail}</p><p class="hint">如果你更换了手机或清除了Safari数据，请重新打开首次授权链接。</p>`;
+        status.innerHTML = `<h1 class="error">${title}</h1><p>${detail}</p><form id="retry"><button type="submit">重新加载</button></form>`;
+        document.getElementById('retry').addEventListener('submit', event => { event.preventDefault(); location.reload(); });
       };
-      const open = async () => {
-        try {
-          const fragment = new URLSearchParams(location.hash.slice(1));
-          const incoming = fragment.get('k');
-          if (incoming) {
-            if (decode(incoming).length !== 32) throw new Error('invalid-key');
-            localStorage.setItem(keyName, incoming);
-          }
-          const stored = localStorage.getItem(keyName);
-          if (!stored) {
-            fail('需要首次授权链接', '这个公开地址不包含业务数据。请使用收到的完整授权链接打开一次，无需输入密码。');
+      const authorize = detail => {
+        status.innerHTML = `<h1>需要首次授权</h1><p>${detail}</p><form id="authorize"><input id="authLink" type="text" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="粘贴完整授权链接"><button type="submit">在此应用授权</button></form><p class="hint">链接只在本机解密，不会提交到服务器；以后无需输入密码。</p>`;
+        document.getElementById('authorize').addEventListener('submit', event => {
+          event.preventDefault();
+          const input = document.getElementById('authLink');
+          input.setCustomValidity('');
+          const value = input.value.trim();
+          let candidate = value;
+          try {
+            const pasted = new URL(value, location.href);
+            candidate = new URLSearchParams(pasted.hash.slice(1)).get('k') || value;
+          } catch (_) {}
+          try {
+            if (decode(candidate).length !== 32) throw new Error('invalid-key');
+          } catch (_) {
+            input.setCustomValidity('请粘贴完整、有效的授权链接');
+            input.reportValidity();
             return;
           }
-          const response = await fetch('./app.enc.json', { cache: 'no-store' });
-          if (!response.ok) throw new Error('payload');
-          const payload = await response.json();
-          const encrypted = decode(payload.ciphertext);
-          const key = await crypto.subtle.importKey('raw', decode(stored), 'AES-GCM', false, ['decrypt']);
-          const compressed = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: decode(payload.iv) }, key, encrypted);
-          const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
-          const html = await new Response(stream).arrayBuffer();
-          document.open();
-          document.write(new TextDecoder().decode(html));
-          document.close();
-        } catch (error) {
-          fail('无法解密数据', '授权链接可能不完整，或本机保存的授权信息已经失效。');
+          location.hash = `k=${encodeURIComponent(candidate)}`;
+          location.reload();
+        });
+      };
+      const persistPair = async (raw, manifest) => {
+        if (!('caches' in window)) return;
+        const base = new URL('./', location.href);
+        const suffix = `?offline=${manifest.envelopeSha256}`;
+        const cache = await caches.open(dataCache);
+        await Promise.all([
+          cache.put(new Request(new URL(`app.enc.json${suffix}`, base)), new Response(raw.slice(0), { headers: { 'Content-Type': 'application/json' } })),
+          cache.put(new Request(new URL(`pwa-data-version.json${suffix}`, base)), new Response(JSON.stringify(manifest), { headers: { 'Content-Type': 'application/json' } }))
+        ]);
+        await cache.put(new Request(new URL('pwa-data-current.json', base)), new Response(JSON.stringify({ sha: manifest.envelopeSha256 }), { headers: { 'Content-Type': 'application/json' } }));
+        const keys = await cache.keys();
+        await Promise.all(keys.filter(request => {
+          const url = new URL(request.url);
+          return url.searchParams.has('offline') && url.searchParams.get('offline') !== manifest.envelopeSha256;
+        }).map(request => cache.delete(request)));
+      };
+      const decrypt = async (candidate, payload) => {
+        const encrypted = decode(payload.ciphertext);
+        const key = await crypto.subtle.importKey('raw', decode(candidate), 'AES-GCM', false, ['decrypt']);
+        const compressed = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: decode(payload.iv) }, key, encrypted);
+        const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
+        return new TextDecoder().decode(await new Response(stream).arrayBuffer());
+      };
+      const open = async () => {
+        const fragment = new URLSearchParams(location.hash.slice(1));
+        const incoming = fragment.get('k');
+        if (incoming) history.replaceState(null, '', location.pathname + location.search);
+        let stored = null;
+        try { stored = localStorage.getItem(keyName); } catch (_) {}
+        const candidates = [];
+        for (const candidate of [incoming, stored]) {
+          try {
+            if (candidate && decode(candidate).length === 32 && !candidates.includes(candidate)) candidates.push(candidate);
+          } catch (_) {}
         }
+        if (!candidates.length) {
+          const installed = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+          authorize(installed ? '主屏应用使用独立的安全存储。请把收到的完整授权链接粘贴一次。' : '请打开或粘贴收到的完整授权链接，无需输入密码。');
+          return;
+        }
+        if (!crypto.subtle || typeof DecompressionStream === 'undefined') {
+          fail('浏览器版本不支持', '请升级 iOS/Safari 后重新打开，系统没有改动或丢弃你的授权信息。');
+          return;
+        }
+        let raw;
+        let manifest;
+        let payload;
+        try {
+          const [response, manifestResponse] = await Promise.all([
+            fetch('./app.enc.json', { cache: 'no-store' }),
+            fetch('./pwa-data-version.json', { cache: 'no-store' })
+          ]);
+          if (!response.ok || !manifestResponse.ok) throw new Error('payload');
+          [raw, manifest] = await Promise.all([response.arrayBuffer(), manifestResponse.json()]);
+          const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', raw))]
+            .map(value => value.toString(16).padStart(2, '0')).join('');
+          if (digest !== manifest.envelopeSha256) throw new Error('integrity');
+          payload = JSON.parse(new TextDecoder().decode(raw));
+          if (payload.v !== 1 || payload.alg !== 'AES-256-GCM' || payload.compression !== 'gzip') {
+            throw new Error('format');
+          }
+        } catch (_) {
+          fail('数据暂时不可用', '完整性校验未通过，系统已拒绝加载不完整或不匹配的数据。');
+          return;
+        }
+        for (const candidate of candidates) {
+          try {
+            const html = await decrypt(candidate, payload);
+            try { localStorage.setItem(keyName, candidate); } catch (_) {}
+            await persistPair(raw, manifest).catch(() => {});
+            if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+            document.open();
+            document.write(html);
+            document.close();
+            return;
+          } catch (_) {}
+        }
+        try { localStorage.removeItem(keyName); } catch (_) {}
+        authorize('授权链接无效或已经轮换。请重新粘贴最新的完整授权链接。');
       };
       if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
       open();
