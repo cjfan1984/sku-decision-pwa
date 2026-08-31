@@ -5,6 +5,12 @@ on:
     # 23:45 Asia/Shanghai. GitHub cron is UTC.
     - cron: "45 15 * * *"
   workflow_dispatch:
+    inputs:
+      allow_record_drop:
+        description: "Allow a verified decrease in source SKU count"
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -22,8 +28,6 @@ concurrency:
 
 env:
   SKU_SHEET_ID: 108o5gtxkUsWEZI8xfZFE89Kq83IfStQGNm6dvjIlAkk
-  GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-  PWA_APP_KEY: ${{ secrets.PWA_APP_KEY }}
 
 jobs:
   sync:
@@ -32,45 +36,48 @@ jobs:
     steps:
       - name: Enforce credential-only operation
         shell: bash
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          PWA_APP_KEY: ${{ secrets.PWA_APP_KEY }}
         run: |
           set -euo pipefail
           if [ -z "$GOOGLE_SERVICE_ACCOUNT_JSON" ] || [ -z "$PWA_APP_KEY" ]; then
-            echo "ZERO_GPT_READY=false" >> "$GITHUB_ENV"
             echo "NEEDS_CREDENTIALS: add GOOGLE_SERVICE_ACCOUNT_JSON and PWA_APP_KEY; no GPT/browser fallback will run."
-          else
-            echo "ZERO_GPT_READY=true" >> "$GITHUB_ENV"
+            exit 1
           fi
 
       - name: Checkout
-        if: env.ZERO_GPT_READY == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        if: env.ZERO_GPT_READY == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install and test deterministic builder
-        if: env.ZERO_GPT_READY == 'true'
         run: |
           pip install -r requirements.txt pytest
-          python -m py_compile tools/build_encrypted_app.py tools/physical_sku.py tools/sync_google.py
+          python -m py_compile tools/build_encrypted_app.py tools/physical_sku.py tools/sync_google.py tools/validate_deploy.py
           pytest -q
 
       - name: Sync authoritative snapshot through physical-SKU gate
-        if: env.ZERO_GPT_READY == 'true'
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          PWA_APP_KEY: ${{ secrets.PWA_APP_KEY }}
+          ALLOW_RECORD_DROP: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_record_drop || 'false' }}
         run: |
           python tools/sync_google.py \
             --spreadsheet-id "$SKU_SHEET_ID" \
             --status sync-status.json
 
       - name: Verify encrypted output and stable manifest
-        if: env.ZERO_GPT_READY == 'true'
+        env:
+          PWA_APP_KEY: ${{ secrets.PWA_APP_KEY }}
         run: |
+          python tools/validate_deploy.py --key-env PWA_APP_KEY
           python - <<'PY'
           from pathlib import Path
           import hashlib, json
@@ -90,13 +97,12 @@ jobs:
           PY
 
       - name: Commit only a real source-data change
-        if: env.ZERO_GPT_READY == 'true'
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app.enc.json pwa-data-version.json
+          git add app.enc.json pwa-data-version.json recovery/app-baseline.enc.json
           if git diff --cached --quiet; then
             echo "PRODUCTION_DATA_CHANGED=false"
             exit 0
@@ -106,7 +112,8 @@ jobs:
           echo "PRODUCTION_DATA_CHANGED=true"
 
       - name: Upload non-sensitive status
-        if: always() && env.ZERO_GPT_READY == 'true'
+        if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: sku-production-zero-gpt-status

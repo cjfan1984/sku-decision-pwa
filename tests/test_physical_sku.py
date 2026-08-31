@@ -35,12 +35,34 @@ def test_blind_rivet_and_rivet_nut_are_different_families():
 
 def test_m_thread_evidence_blocks_blind_riveter():
     bad = row("抽芯铆钉枪", "2.4–6.4mm；错误附带M3 M4 M5 M6")
-    assert "M-thread evidence attached to blind riveter" in p.validate_row(bad)
+    assert "M-thread in blind-riveter target identity" in p.validate_row(bad)
 
 
 def test_piece_pack_and_kg_pack_cannot_share_exact_market_evidence():
     bad = row("木工自攻螺丝", "4×60mm 100颗；同证据又写1kg装", family="自攻螺丝")
-    assert "kg-pack and piece-pack evidence mixed" in p.validate_row(bad)
+    assert "target identity mixes kg-pack and piece-pack" in p.validate_row(bad)
+
+
+def test_pending_attribute_does_not_erase_concrete_target_identity():
+    item = row("切割片10片装", "125×1.0×22.23mm｜10片装｜认证批次待核")
+    assert "exact evidence missing target specification" not in p.validate_row(item)
+
+
+def test_blank_target_spec_blocks_exact_evidence():
+    item = row("切割片10片装", "")
+    assert "exact evidence missing target specification" in p.validate_row(item)
+
+
+@pytest.mark.parametrize("spec", ["待核/待补", "待研究/未闭环", "规格待核"])
+def test_placeholder_only_target_spec_blocks_exact_evidence(spec):
+    item = row("切割片10片装", spec)
+    assert "exact evidence missing target specification" in p.validate_row(item)
+
+
+@pytest.mark.parametrize("spec", ["M3", "M10", "5mm", "1kg", "2片"])
+def test_short_concrete_target_spec_is_valid(spec):
+    item = row("短规格", spec)
+    assert "exact evidence missing target specification" not in p.validate_row(item)
 
 
 def test_vacuum_roll_and_pre_cut_bag_are_separate():

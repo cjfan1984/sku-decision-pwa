@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
@@ -84,7 +85,18 @@ def decrypt_html_from_value(envelope: dict[str, Any], key: bytes) -> str:
 
 def decrypt_html(envelope_path: Path, key: bytes) -> str:
     envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    if not isinstance(envelope, dict):
+        raise ValueError("encrypted app envelope must be a JSON object")
     return decrypt_html_from_value(envelope, key)
+
+
+def decrypt_html_with_recovery(envelope_path: Path, recovery_path: Path | None, key: bytes) -> tuple[str, str]:
+    try:
+        return decrypt_html(envelope_path, key), "current"
+    except (OSError, ValueError, KeyError, TypeError, InvalidTag):
+        if recovery_path is None or not recovery_path.exists() or recovery_path == envelope_path:
+            raise
+        return decrypt_html(recovery_path, key), "recovery"
 
 
 def encrypt_html(html: str, key: bytes) -> dict[str, Any]:
@@ -358,8 +370,9 @@ def sync(
     *,
     partial: bool = False,
     expected_records: int | None = None,
+    recovery_envelope_path: Path | None = None,
 ) -> dict[str, Any]:
-    html = decrypt_html(envelope_path, key)
+    html, template_source = decrypt_html_with_recovery(envelope_path, recovery_envelope_path, key)
     payload = extract_payload(html)
     rows = json.loads(snapshot_path.read_text(encoding="utf-8"))
     if not isinstance(rows, list):
@@ -375,7 +388,15 @@ def sync(
             previous = json.loads(manifest_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             previous = {}
-    if previous.get("datasetSha256") == dataset_sha and previous.get("records") == len(payload["records"]):
+    current_envelope_matches = False
+    if output_path.exists() and previous.get("envelopeSha256"):
+        current_envelope_matches = hashlib.sha256(output_path.read_bytes()).hexdigest() == previous["envelopeSha256"]
+    if (
+        template_source == "current"
+        and current_envelope_matches
+        and previous.get("datasetSha256") == dataset_sha
+        and previous.get("records") == len(payload["records"])
+    ):
         return {"state": "NO_CHANGE", "records": len(payload["records"]), "datasetSha256": dataset_sha}
     envelope = encrypt_html(html, key)
     output_path.write_text(json.dumps(envelope, separators=(",", ":")), encoding="utf-8")
@@ -388,7 +409,7 @@ def sync(
         "envelopeSha256": encrypted_sha,
     }
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"state": "CHANGED", **manifest}
+    return {"state": "RECOVERED" if template_source == "recovery" else "CHANGED", **manifest}
 
 
 def main() -> None:
@@ -397,6 +418,7 @@ def main() -> None:
     parser.add_argument("--snapshot-json", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("app.enc.json"))
     parser.add_argument("--manifest", type=Path, default=Path("pwa-data-version.json"))
+    parser.add_argument("--recovery-envelope", type=Path, default=Path("recovery/app-baseline.enc.json"))
     parser.add_argument("--key-env", default="PWA_APP_KEY")
     parser.add_argument("--partial", action="store_true")
     parser.add_argument("--expected-records", type=int)
@@ -412,6 +434,7 @@ def main() -> None:
         load_key(key_value),
         partial=args.partial,
         expected_records=args.expected_records,
+        recovery_envelope_path=args.recovery_envelope,
     )
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
 
