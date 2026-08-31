@@ -20,19 +20,22 @@ on:
       - ".github/workflows/sync-zero-gpt.yml"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: sku-production-zero-gpt
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   SKU_SHEET_ID: 108o5gtxkUsWEZI8xfZFE89Kq83IfStQGNm6dvjIlAkk
 
 jobs:
   sync:
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    outputs:
+      data_changed: ${{ steps.data_change.outputs.changed }}
     steps:
       - name: Enforce credential-only operation
         shell: bash
@@ -47,12 +50,14 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: main
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
           cache: pip
@@ -69,6 +74,7 @@ jobs:
           PWA_APP_KEY: ${{ secrets.PWA_APP_KEY }}
           ALLOW_RECORD_DROP: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_record_drop || 'false' }}
         run: |
+          sha256sum app.enc.json pwa-data-version.json recovery/app-baseline.enc.json > production-base.sha256
           python tools/sync_google.py \
             --spreadsheet-id "$SKU_SHEET_ID" \
             --status sync-status.json
@@ -96,27 +102,115 @@ jobs:
           print('PRODUCTION_PHYSICAL_SKU_GATE=PASS', manifest['records'], manifest['version'])
           PY
 
-      - name: Commit only a real source-data change
+      - name: Detect a real source-data change
+        id: data_change
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add app.enc.json pwa-data-version.json recovery/app-baseline.enc.json
           if git diff --cached --quiet; then
             echo "PRODUCTION_DATA_CHANGED=false"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git commit -m "Sync encrypted SKU dashboard data"
-          git push origin HEAD:main
           echo "PRODUCTION_DATA_CHANGED=true"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload validated encrypted publish bundle
+        if: steps.data_change.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sku-pwa-publish-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            app.enc.json
+            pwa-data-version.json
+            recovery/app-baseline.enc.json
+            production-base.sha256
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload non-sensitive status
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sku-production-zero-gpt-status
+          name: sku-production-zero-gpt-status-${{ github.run_id }}-${{ github.run_attempt }}
           path: sync-status.json
           if-no-files-found: ignore
           retention-days: 7
+
+  publish:
+    needs: sync
+    if: needs.sync.outputs.data_changed == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout main without persistent credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download validated encrypted publish bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sku-pwa-publish-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .publish-bundle
+
+      - name: Commit and publish with bounded race recovery
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if cmp -s .publish-bundle/app.enc.json app.enc.json \
+            && cmp -s .publish-bundle/pwa-data-version.json pwa-data-version.json \
+            && cmp -s .publish-bundle/recovery/app-baseline.enc.json recovery/app-baseline.enc.json; then
+            echo "Validated data is already on main."
+            exit 0
+          fi
+          sha256sum --check .publish-bundle/production-base.sha256
+          cp .publish-bundle/app.enc.json app.enc.json
+          cp .publish-bundle/pwa-data-version.json pwa-data-version.json
+          mkdir -p recovery
+          cp .publish-bundle/recovery/app-baseline.enc.json recovery/app-baseline.enc.json
+          git add app.enc.json pwa-data-version.json recovery/app-baseline.enc.json
+          if git diff --cached --quiet; then
+            echo "Validated data is already on main."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Sync encrypted SKU dashboard data"
+
+          git_with_auth() {
+            git \
+              -c credential.helper= \
+              -c 'credential.helper=!f() { echo "username=x-access-token"; echo "password=$GH_TOKEN"; }; f' \
+              "$@"
+          }
+
+          for attempt in 1 2 3; do
+            if ! git_with_auth fetch --no-tags origin main; then
+              if [ "$attempt" -eq 3 ]; then
+                echo "Unable to refresh main after 3 attempts."
+                exit 1
+              fi
+              sleep $((attempt * 2))
+              continue
+            fi
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              echo "Main changed the generated data files; refusing an unsafe automatic merge."
+              exit 1
+            fi
+            if git_with_auth push origin HEAD:main; then
+              exit 0
+            fi
+            sleep $((attempt * 2))
+          done
+          echo "Main kept advancing; retry on the next scheduled run."
+          exit 1
