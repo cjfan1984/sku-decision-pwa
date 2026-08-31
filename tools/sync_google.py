@@ -4,16 +4,37 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import shutil
+import time
 from pathlib import Path
 
 import gspread
 from cryptography.exceptions import InvalidTag
+from google.auth.exceptions import TransportError as GoogleTransportError
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
+from gspread.http_client import HTTPClient
+from requests.exceptions import ChunkedEncodingError as RequestsChunkedEncodingError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 
 from build_encrypted_app import decrypt_html_with_recovery, extract_payload, load_key, sync
 from physical_sku import validate_and_enrich_snapshot
 from validate_deploy import load_manifest
+
+
+GOOGLE_CONNECT_TIMEOUT_SECONDS = 10
+GOOGLE_READ_TIMEOUT_SECONDS = 45
+GOOGLE_READ_ATTEMPTS = 3
+
+
+class BoundedGoogleHTTPClient(HTTPClient):
+    """Give every Google request a finite connect/read deadline."""
+
+    def __init__(self, auth, session=None):
+        super().__init__(auth, session)
+        self.timeout = (GOOGLE_CONNECT_TIMEOUT_SECONDS, GOOGLE_READ_TIMEOUT_SECONDS)
 
 
 def credentials():
@@ -29,9 +50,52 @@ def credentials():
     )
 
 
+def _is_transient_google_error(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (
+            GoogleTransportError,
+            RequestsChunkedEncodingError,
+            RequestsConnectionError,
+            RequestsTimeout,
+        ),
+    ):
+        return True
+    if not isinstance(exc, APIError):
+        return False
+    code = getattr(exc, "code", None)
+    if code in (408, 429) or (isinstance(code, int) and code >= 500):
+        return True
+    if code == 403:
+        detail = getattr(exc, "error", None)
+        errors = (detail.get("errors") or []) if isinstance(detail, dict) else []
+        return any(isinstance(item, dict) and item.get("domain") == "usageLimits" for item in errors)
+    return False
+
+
+def _read_snapshot(spreadsheet_id: str) -> list[dict]:
+    client = gspread.authorize(credentials(), http_client=BoundedGoogleHTTPClient)
+    worksheet = client.open_by_key(spreadsheet_id).worksheet("SKU决策快照")
+    return worksheet.get_all_records(default_blank=None, numericise_ignore=["all"])
+
+
 def snapshot_rows(spreadsheet_id: str) -> list[dict]:
-    worksheet = gspread.authorize(credentials()).open_by_key(spreadsheet_id).worksheet("SKU决策快照")
-    rows = worksheet.get_all_records(default_blank=None, numericise_ignore=["all"])
+    for attempt in range(1, GOOGLE_READ_ATTEMPTS + 1):
+        try:
+            rows = _read_snapshot(spreadsheet_id)
+            break
+        except (
+            APIError,
+            GoogleTransportError,
+            RequestsChunkedEncodingError,
+            RequestsConnectionError,
+            RequestsTimeout,
+        ) as exc:
+            if attempt == GOOGLE_READ_ATTEMPTS or not _is_transient_google_error(exc):
+                raise
+            delay = min(2 ** (attempt - 1), 4) + random.uniform(0, 0.5)
+            print(f"Transient Google API failure; retrying {attempt + 1}/{GOOGLE_READ_ATTEMPTS} in {delay:.1f}s")
+            time.sleep(delay)
     identity_fields = ("主库行", "一级系统", "产品族", "产品名称/SKU")
     missing_keys = [
         index
