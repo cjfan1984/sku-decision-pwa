@@ -1,0 +1,87 @@
+name: YAPEX Ozon Profit Data Sync
+
+on:
+  schedule:
+    # 08:00, 14:00 and 20:00 Asia/Shanghai. GitHub cron is UTC.
+    - cron: "0 0,6,12 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/sync_ozon_profit.py"
+      - "tests/test_sync_ozon_profit.py"
+      - "requirements.txt"
+      - ".github/workflows/sync-ozon-profit.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "tools/sync_ozon_profit.py"
+      - "tests/test_sync_ozon_profit.py"
+      - "requirements.txt"
+      - ".github/workflows/sync-ozon-profit.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yapex-ozon-profit-sync
+  cancel-in-progress: false
+
+env:
+  INVENTORY_SHEET_ID: 1UlTMAzdr-YV5zm-ma60VRbroTenDLqmK1Y_h6gJG5i0
+  EXPECTED_SELLER_CLIENT_ID: "2622339"
+  PERF_AUTH_MODE: auto
+  PERF_STATS_PATH: /api/client/statistics/daily
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install and test
+        run: |
+          set -euo pipefail
+          pip install -r requirements.txt pytest
+          python -m py_compile tools/sync_ozon_profit.py
+          pytest -q tests/test_sync_ozon_profit.py
+
+  sync:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Sync YAPEX finance and ads data from Ozon APIs
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          python tools/sync_ozon_profit.py \
+            --spreadsheet-id "$INVENTORY_SHEET_ID" \
+            --finance-days 186 \
+            --ads-days 62 | tee ozon-sync-status.json
+      - name: Upload non-sensitive sync status
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: yapex-ozon-profit-status-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ozon-sync-status.json
+          if-no-files-found: ignore
+          retention-days: 7
