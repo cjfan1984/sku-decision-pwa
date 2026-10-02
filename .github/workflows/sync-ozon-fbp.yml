@@ -1,0 +1,77 @@
+name: Ozon FBP Stock Sync
+
+on:
+  schedule:
+    # Every 6 hours; UTC. Covers fresh FBP stock/order visibility without high API load.
+    - cron: "15 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/sync_ozon_fbp.py"
+      - "tests/test_sync_ozon_fbp.py"
+      - "requirements.txt"
+      - ".github/workflows/sync-ozon-fbp.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yapex-ozon-fbp-sync
+  cancel-in-progress: false
+
+env:
+  INVENTORY_SHEET_ID: 1UlTMAzdr-YV5zm-ma60VRbroTenDLqmK1Y_h6gJG5i0
+  EXPECTED_SELLER_CLIENT_ID: "2622339"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install and test
+        run: |
+          set -euo pipefail
+          pip install -r requirements.txt pytest
+          python -m py_compile tools/sync_ozon_fbp.py
+          pytest -q tests/test_sync_ozon_fbp.py
+
+  sync:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Sync Ozon stock and FBP data
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          python tools/sync_ozon_fbp.py \
+            --spreadsheet-id "$INVENTORY_SHEET_ID" \
+            --fbp-days 186 | tee fbp-sync-status.json
+      - name: Upload non-sensitive sync status
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: yapex-ozon-fbp-status-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fbp-sync-status.json
+          if-no-files-found: ignore
+          retention-days: 7
